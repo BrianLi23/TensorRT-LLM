@@ -179,8 +179,8 @@ class BasePipeline(nn.Module):
         self._postdenoise_pending: bool = self._profile_range == "postdenoise"
 
         # torch.profiler scoping (TLLM_TORCH_PROFILE_VISUAL_GEN env var). Consumed
-        # worker-side; emits a Chrome trace (gzip-compressed when the out path ends
-        # in .gz) plus source-stack exports (with_stack=True).
+        # worker-side; emits a Chrome trace (gzip-compressed when the out path
+        # ends in .gz). Source stacks are not recorded (with_stack=False).
         self._torch_profile_scope = _parse_torch_profile_scope()
         self._torch_profile_out = os.environ.get(
             "TLLM_TORCH_PROFILE_VISUAL_GEN_OUT", "trace.json.gz"
@@ -222,16 +222,15 @@ class BasePipeline(nn.Module):
             return None
         # with_stack records Python/TorchScript source stacks for every op (needed
         # for export_stacks()/flamegraphs and group_by_stack_n). It adds host-side
-        # overhead and inflates the trace, so it is toggleable:
-        #   TLLM_TORCH_PROFILE_VISUAL_GEN_STACK=0  -> with_stack=False ("nostack")
-        # Default is on. record_shapes + with_modules stay on (cheap, useful).
+        # overhead and inflates the trace, so it is kept off. record_shapes +
+        # with_modules stay on (cheap, useful).
         self._torch_profile_with_stack = False
         prof = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            with_stack=with_stack,
+            with_stack=self._torch_profile_with_stack,
             record_shapes=True,
             with_modules=True,
         )
@@ -239,7 +238,8 @@ class BasePipeline(nn.Module):
         if self.rank == 0:
             logger.info(
                 f"[torch-profile/CUSTOM] Torch profiler started "
-                f"(scope={scope}, with_stack={with_stack}, record_shapes=True, with_modules=True)"
+                f"(scope={scope}, with_stack={self._torch_profile_with_stack}, "
+                f"record_shapes=True, with_modules=True)"
             )
         return prof
 
