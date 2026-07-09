@@ -24,3 +24,9 @@ parallel_config:
   ulysses_size: 1
 cuda_graph_config:
   enable: false
+compilation_config:
+  # Warm up at 1024x1024 to match the profiled resolution (image seq_len ~4096
+  # +text ~4113), matching SGLang. Avoids first-step autotune inside the trace.
+  resolutions:
+    - [1024, 1024]
+  num_frames: [1]

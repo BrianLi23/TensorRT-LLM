@@ -1,0 +1,35 @@
+# 1-GPU Qwen-Image, FP8 dynamic quant — SGLang-matched layer selection.
+# Quantizes ONLY the image stream (matches SGLang Qwen-Image FP8):
+#   transformer_blocks.*.attn.to_q / to_k / to_v / to_out.0   (image QKV + out)
+#   transformer_blocks.*.img_mlp.up_proj / down_proj          (image MLP)
+# Everything else stays BF16 via the quant ignore list (fnmatch on name + ancestors):
+#   text stream (add_*_proj, to_add_out, txt_mlp), modulation (img_mod/txt_mod),
+#   final AdaLN (norm_out), and embed/readout (img_in, txt_in, proj_out).
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+  ignore:
+    - "*add_q_proj"
+    - "*add_k_proj"
+    - "*add_v_proj"
+    - "*to_add_out"
+    - "*txt_mlp"
+    - "*img_mod"
+    - "*txt_mod"
+    - "*norm_out"
+    - "img_in"
+    - "txt_in"
+    - "proj_out"
+attention_config:
+  backend: VANILLA
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+cuda_graph_config:
+  enable: false
+compilation_config:
+  # Warm up at 1024x1024 to match the profiled resolution (image seq_len ~4096
+  # +text ~4113), matching SGLang. Avoids first-step autotune inside the trace.
+  resolutions:
+    - [1024, 1024]
+  num_frames: [1]

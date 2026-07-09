@@ -1,0 +1,19 @@
+# 1-GPU FLUX.2-dev, FP8 dynamic quant — SGLang-matched layer selection.
+# Same layer set as the NVFP4 sibling (image stream of dual blocks + all single
+# blocks), matching SGLang's flux2 image-stream-only recipe.
+#
+# Quant format note: SGLang's FP8 path is `--enable-fp8-blockwise-quant`
+# (B10Fp8BlockwiseConfig = 2D blockwise weight scales + per-token-group act
+# scales). The faithful TRT-LLM match is therefore FP8_BLOCK_SCALES, NOT the
+# per-tensor `FP8` algo. Switch quant_algo to `FP8` if you specifically want
+# per-tensor FP8 instead.
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+attention_config:
+  backend: VANILLA
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+cuda_graph_config:
+  enable: false

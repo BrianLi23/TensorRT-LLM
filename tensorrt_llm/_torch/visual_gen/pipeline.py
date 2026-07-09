@@ -96,6 +96,39 @@ def _parse_profile_range():
     return frozenset(starts), frozenset(stops)
 
 
+def _parse_torch_profile_scope():
+    """Parse ``TLLM_TORCH_PROFILE_VISUAL_GEN`` for ``torch.profiler`` scoping.
+
+    PyTorch-profiler counterpart to :func:`_parse_profile_range` (which drives the
+    CUDA/nsys profiler). It exists because the pipeline — and therefore every model
+    kernel — runs inside the worker process, not the user's client script: wrapping
+    ``visual_gen.generate()`` on the client side would only capture IPC waiting.
+
+    Supported values:
+
+    * ``generate``    – profile the full per-request inference (text encode +
+                        denoise loop + VAE decode), wrapped worker-side around
+                        ``pipeline.infer()`` in the executor.
+    * ``denoise``     – profile only the denoise loop in :meth:`denoise`.
+    * ``off`` / unset – no torch profiling.
+
+    Returns ``"generate"``, ``"denoise"`` or ``None``.
+    """
+    val = os.environ.get("TLLM_TORCH_PROFILE_VISUAL_GEN")
+    if not val:
+        return None
+    val = val.strip().lower()
+    if val in ("", "off", "none"):
+        return None
+    if val not in ("generate", "denoise"):
+        logger.warning(
+            f"Ignoring TLLM_TORCH_PROFILE_VISUAL_GEN={val!r}; "
+            "expected one of 'generate', 'denoise', 'off'."
+        )
+        return None
+    return val
+
+
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
     from .config import DiffusionPipelineConfig
@@ -145,6 +178,14 @@ class BasePipeline(nn.Module):
         self._predenoise_pending: bool = self._profile_range == "predenoise"
         self._postdenoise_pending: bool = self._profile_range == "postdenoise"
 
+        # torch.profiler scoping (TLLM_TORCH_PROFILE_VISUAL_GEN env var). Consumed
+        # worker-side; emits a Chrome trace (gzip-compressed when the out path ends
+        # in .gz) plus source-stack exports (with_stack=True).
+        self._torch_profile_scope = _parse_torch_profile_scope()
+        self._torch_profile_out = os.environ.get(
+            "TLLM_TORCH_PROFILE_VISUAL_GEN_OUT", "trace.json.gz"
+        )
+
         # Initialize transformer
         self._init_transformer()
 
@@ -168,6 +209,83 @@ class BasePipeline(nn.Module):
             self._profiling_active = False
             if self.rank == 0:
                 logger.info("CUDA profiler stopped")
+
+    def _maybe_start_torch_profile(self, scope: str):
+        """Start a ``torch.profiler`` if the configured scope matches *scope*.
+
+        *scope* is the region being entered (``"generate"`` or ``"denoise"``).
+        Profiling activates only when it equals ``self._torch_profile_scope`` and
+        we are not warming up. Returns the started profiler handle (pass it to
+        :meth:`_maybe_stop_torch_profile`) or ``None`` when inactive.
+        """
+        if self._is_warmup or self._torch_profile_scope != scope:
+            return None
+        # with_stack records Python/TorchScript source stacks for every op (needed
+        # for export_stacks()/flamegraphs and group_by_stack_n). It adds host-side
+        # overhead and inflates the trace, so it is toggleable:
+        #   TLLM_TORCH_PROFILE_VISUAL_GEN_STACK=0  -> with_stack=False ("nostack")
+        # Default is on. record_shapes + with_modules stay on (cheap, useful).
+        self._torch_profile_with_stack = False
+        prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            with_stack=with_stack,
+            record_shapes=True,
+            with_modules=True,
+        )
+        prof.start()
+        if self.rank == 0:
+            logger.info(
+                f"[torch-profile/CUSTOM] Torch profiler started "
+                f"(scope={scope}, with_stack={with_stack}, record_shapes=True, with_modules=True)"
+            )
+        return prof
+
+    def _maybe_stop_torch_profile(self, prof) -> None:
+        """Stop *prof* (if any), export a Chrome trace + source stacks, and log a summary.
+
+        The trace path is gzip-compressed automatically when it ends in ``.gz``. In
+        multi-rank runs the rank index is inserted before the suffix so concurrent
+        ranks do not clobber each other's traces.
+        """
+        if prof is None:
+            return
+        prof.stop()
+        path = self._torch_profile_out
+        if self.world_size > 1:
+            for suffix in (".json.gz", ".json", ".gz"):
+                if path.endswith(suffix):
+                    path = f"{path[: -len(suffix)]}_rank{self.rank}{suffix}"
+                    break
+            else:
+                root, ext = os.path.splitext(path)
+                path = f"{root}_rank{self.rank}{ext}"
+        prof.export_chrome_trace(path)
+        logger.info(f"[torch-profile/CUSTOM] Torch profiler trace written to {os.path.abspath(path)}")
+
+        # Source-stack export requires with_stack=True; skip in nostack mode.
+        if getattr(self, "_torch_profile_with_stack", False):
+            for metric in ("self_cuda_time_total", "self_cpu_time_total"):
+                stacks_path = f"{path}.{metric}.stacks.txt"
+                try:
+                    prof.export_stacks(stacks_path, metric)
+                    logger.info(
+                        f"[torch-profile/CUSTOM] Torch profiler stacks ({metric}) "
+                        f"written to {os.path.abspath(stacks_path)}"
+                    )
+                except Exception as e:  # export_stacks requires with_stack=True
+                    logger.warning(f"[torch-profile/CUSTOM] export_stacks({metric}) failed: {e}")
+
+        # Human-readable top-ops summary in the worker log.
+        try:
+            table = prof.key_averages(group_by_stack_n=0).table(
+                sort_by="self_cuda_time_total", row_limit=25
+            )
+            logger.info(f"[torch-profile/CUSTOM] Top ops by self CUDA time:\n{table}")
+        except Exception as e:
+            logger.warning(f"[torch-profile/CUSTOM] key_averages table failed: {e}")
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay.
@@ -1095,6 +1213,11 @@ class BasePipeline(nn.Module):
 
         start_time = time.time()
 
+        # torch.profiler "denoise" scope: capture just the denoise loop (model
+        # kernels), excluding text-encode/VAE. No-op unless
+        # TLLM_TORCH_PROFILE_VISUAL_GEN=denoise. Closed after the loop below.
+        torch_prof = self._maybe_start_torch_profile("denoise")
+
         # CUDA profiler scoping: "all" starts here (covers denoise + VAE),
         # step ranges start/stop at specific indices. See _parse_profile_range().
         prof = self._profile_range
@@ -1190,6 +1313,9 @@ class BasePipeline(nn.Module):
             # Step-level profiler stop
             if prof_step_stops is not None and i in prof_step_stops and not self._is_warmup:
                 self._cuda_profiler_stop()
+
+        # Close the torch.profiler "denoise" scope and export the trace.
+        self._maybe_stop_torch_profile(torch_prof)
 
         # ``postdenoise`` mode: arm the profiler now so the VAE decode (and
         # any post-denoise host work) is captured up to cleanup(). Single-shot.

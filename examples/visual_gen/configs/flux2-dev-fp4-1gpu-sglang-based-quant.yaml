@@ -1,0 +1,39 @@
+# 1-GPU FLUX.2-dev, NVFP4 dynamic quant — SGLang-matched layer selection.
+# Mirrors SGLang's shipped flux2 NVFP4 recipe (calib/flux2_fp4_scales.json),
+# which quantizes ONLY:
+#   transformer_blocks.*.attn.{to_q,to_k,to_v,to_out}   (dual-block IMAGE attn)
+#   transformer_blocks.*.ff.{gate_up_proj,down_proj}    (dual-block IMAGE MLP)
+#   single_transformer_blocks.*.attn.{to_qkv_mlp_proj,to_out}  (all single blocks)
+# Everything else stays BF16 via the quant ignore list (fnmatch on name + ancestors):
+#   dual-block TEXT stream (add_qkv_proj, to_add_out, ff_context),
+#   shared modulation heads (double_stream_modulation_*/single_stream_modulation),
+#   final AdaLN (norm_out), embed (x_embedder, context_embedder, time_guidance_embed).
+# NOTE: TRT-LLM already auto-excludes x_embedder when in_channels < 128; the
+# explicit entry below is belt-and-suspenders and harmless otherwise.
+# NOTE: proj_out is intentionally left OUT of the ignore list — see the comment
+# in the ignore block (it collides with the single-block to_out load name).
+quant_config:
+  quant_algo: NVFP4
+  dynamic: true
+  ignore:
+    - "*add_qkv_proj"          # dual-block text QKV (fused)
+    - "*to_add_out"            # dual-block text attn output
+    - "*ff_context*"           # dual-block text MLP
+    - "*modulation*"           # shared img/txt/single modulation linears
+    - "*norm_out"              # final AdaLayerNormContinuous linear
+    - "x_embedder"             # patch embed
+    - "context_embedder"       # text embed
+    - "time_guidance_embed*"   # time/guidance embed (nn.Linear; BF16 anyway)
+    # NOTE: deliberately NOT excluding "proj_out". The single-block `to_out`
+    # (FluxJointAttnMLPProj, all 48) loads its inner Linear with a HARDCODED
+    # name "proj_out" (joint_proj.py:124), so a "proj_out" ignore entry collides
+    # and wrongly skips all 48 single-block outputs — which SGLang quantizes.
+    # Trade-off: the single top-level readout `proj_out` is left quantized here
+    # (SGLang keeps it BF16) — a 1-layer divergence, vs. losing 48 layers.
+attention_config:
+  backend: VANILLA
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+cuda_graph_config:
+  enable: false

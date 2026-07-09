@@ -432,7 +432,15 @@ class DiffusionExecutor:
             # full executor-side envelope including any pre/post-pipeline work
             # that the per-phase CUDA-event timings on PipelineOutput do not.
             generation_start = time.perf_counter()
-            output = self.pipeline.infer(req)
+            # torch.profiler "generate" scope: wraps the full per-request inference
+            # (text encode + denoise + VAE decode). No-op unless
+            # TLLM_TORCH_PROFILE_VISUAL_GEN=generate. Runs here, worker-side,
+            # because the model kernels never execute in the client process.
+            torch_prof = self.pipeline._maybe_start_torch_profile("generate")
+            try:
+                output = self.pipeline.infer(req)
+            finally:
+                self.pipeline._maybe_stop_torch_profile(torch_prof)
             generation = time.perf_counter() - generation_start  # seconds
             if self.rank == 0:
                 output.to_handle()
