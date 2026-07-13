@@ -4,8 +4,10 @@ attention_config:
 parallel_config:
   cfg_size: 1
   ulysses_size: 1
+torch_compile_config:
+  enable: true
 cuda_graph_config:
-  enable: false
+  enable: true
 compilation_config:
   # Warm up at 1024x1024 to match the profiled resolution (image seq_len ~4096
   # +text ~4113), matching SGLang. Avoids first-step autotune inside the trace.

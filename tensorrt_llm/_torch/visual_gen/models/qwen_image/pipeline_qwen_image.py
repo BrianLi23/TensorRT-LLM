@@ -500,6 +500,11 @@ class QwenImagePipeline(BasePipeline):
             )[0]
 
             if do_true_cfg:
+                # With CUDA graphs, transformer outputs are weak references into
+                # the graph memory pool. The negative-branch graph shares that
+                # pool and its replay may overwrite this buffer, so copy the
+                # positive prediction out before launching the second graph.
+                noise_pred = noise_pred.clone()
                 # CUDA graph outputs are weak refs into the shared graph memory
                 # pool; the negative-prompt forward uses a different graph
                 # (different text length) captured into the same pool, and its
