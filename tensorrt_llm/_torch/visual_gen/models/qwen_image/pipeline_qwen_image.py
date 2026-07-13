@@ -500,6 +500,11 @@ class QwenImagePipeline(BasePipeline):
             )[0]
 
             if do_true_cfg:
+                # CUDA graph outputs are weak refs into the shared graph memory
+                # pool; the negative-prompt forward uses a different graph
+                # (different text length) captured into the same pool, and its
+                # replay overwrites noise_pred before it is read. Clone first.
+                noise_pred = noise_pred.clone()
                 neg_noise_pred = self.transformer(
                     hidden_states=latents,
                     timestep=timestep / 1000,
