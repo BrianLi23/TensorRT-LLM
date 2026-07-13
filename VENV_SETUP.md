@@ -78,21 +78,45 @@ wheel's compiled artifacts (`bindings*`, `libs/`):
 SITE=/workspace/TensorRT-LLM/.venv-rc20/lib/python3.12/site-packages/tensorrt_llm
 FORK=/workspace/TensorRT-LLM/tensorrt_llm
 
+# Top level: symlink everything EXCEPT compiled artifacts and _torch
+# (_torch is handled per-subtree below).
 for p in "$FORK"/*; do
     name=$(basename "$p")
     case "$name" in
-        bindings*|libs) continue ;;   # compiled binaries only exist in the wheel
+        bindings*|libs|_torch) continue ;;
     esac
     if [ -e "$SITE/$name" ] && [ ! -L "$SITE/$name" ]; then
         mv "$SITE/$name" "$SITE/$name.wheel_orig"   # park the wheel's copy
     fi
     ln -sfn "$p" "$SITE/$name"
 done
+
+# _torch: keep the wheel's copy as the base (its custom_ops must match the
+# wheel's compiled torch-op registrations) and symlink only these subtrees:
+for sub in visual_gen models modules attention_backend speculative configs pyexecutor; do
+    if [ -e "$SITE/_torch/$sub" ] && [ ! -L "$SITE/_torch/$sub" ]; then
+        mv "$SITE/_torch/$sub" "$SITE/_torch/$sub.wheel_orig"
+    fi
+    ln -sfn "$FORK/_torch/$sub" "$SITE/_torch/$sub"
+done
+
+# runtime/ contains one compiled extension in the wheel that the source tree
+# lacks; copy it into the fork so the symlinked runtime keeps working:
+cp -n "$SITE/runtime.wheel_orig/kv_cache_manager_v2/rawref/_rawref.cpython-312-x86_64-linux-gnu.so" \
+      "$FORK/runtime/kv_cache_manager_v2/rawref/" 2>/dev/null || true
 ```
 
 Idempotent — safe to re-run (e.g. after the repo grows a new top-level
 module). To undo one overlay:
 `rm "$SITE/<name>" && mv "$SITE/<name>.wheel_orig" "$SITE/<name>"`.
+
+Why `_torch` cannot be symlinked whole: the wheel's `_torch/custom_ops`
+registers torch custom ops that must exist in the wheel's compiled bindings.
+When the repo is ahead of the wheel, its `custom_ops` references ops the
+rc20 binaries don't have (e.g. `trtllm::is_nccl_window_buffer`) and import
+dies. Keeping the wheel's `_torch` base and symlinking only the pure-Python
+subtrees you edit avoids that. Add more subtrees to the list as needed —
+but check `find <subtree> -name "*.so"` in the wheel copy first.
 
 ## 4. Verify
 
@@ -141,4 +165,6 @@ From here: edit the repo, run with `.venv-rc20/bin/python`, changes are live.
 | "RuntimeError: cannot load MPI library" | no system libmpi | `apt-get install openmpi-bin libopenmpi-dev` |
 | "cannot import name 'bitcount' from 'mpmath.libmp'" | mpmath 1.4+ dropped API sympy uses | `uv pip install mpmath==1.3.0` |
 | "No module named 'tensorrt_llm.<x>'" after overlay | overlaid module imports a repo module not yet symlinked | re-run the overlay loop in step 3 |
+| "No module named 'kv_cache_manager_v2.rawref._rawref'" | symlinked runtime/ lost the wheel's compiled extension | the `cp -n ... _rawref*.so` line in step 3 |
+| "operator trtllm::<op> does not exist" at import | fork's `_torch/custom_ops` newer than wheel bindings | don't symlink `_torch` whole; use the per-subtree overlay in step 3 |
 | "Error 101: invalid device ordinal" from cuInit everywhere | a GPU fell off the bus (here: PCI 0000:03:00.0, `/dev/nvidia1` → ENODEV) | node-level driver reload/reboot by infra; no in-pod workaround |
