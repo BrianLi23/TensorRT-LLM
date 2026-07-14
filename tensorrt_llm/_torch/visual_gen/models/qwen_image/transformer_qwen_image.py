@@ -31,6 +31,7 @@ from tensorrt_llm._torch.modules.linear import (
     Linear,
     TensorParallelMode,
     WeightMode,
+    WeightsLoadingConfig,
 )
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -530,47 +531,54 @@ class QwenJointAttention(Attention):
 
         tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
 
-        # Text-stream QKV (diffusers names). IMAGE-ONLY merge: the image stream
-        # (4096 tokens) fuses q/k/v via the base qkv_proj (qkv_mode above); the
-        # text stream (~51 tokens, negligible perf) stays SEPARATE so the
-        # production quant exclude-list (which names add_q_proj/add_k_proj/
-        # add_v_proj) keeps the text stream in bf16 as the sglang configs intend.
-        self.add_q_proj = Linear(
-            dim,
-            dim,
-            bias=True,
-            dtype=dtype,
-            mapping=self.mapping,
-            quant_config=self.quant_config,
-            skip_create_weights_in_init=self.skip_create_weights_in_init,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-            tensor_parallel_mode=tp_mode,
-            reduce_output=False,
-        )
-        self.add_k_proj = Linear(
-            dim,
-            dim,
-            bias=True,
-            dtype=dtype,
-            mapping=self.mapping,
-            quant_config=self.quant_config,
-            skip_create_weights_in_init=self.skip_create_weights_in_init,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-            tensor_parallel_mode=tp_mode,
-            reduce_output=False,
-        )
-        self.add_v_proj = Linear(
-            dim,
-            dim,
-            bias=True,
-            dtype=dtype,
-            mapping=self.mapping,
-            quant_config=self.quant_config,
-            skip_create_weights_in_init=self.skip_create_weights_in_init,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-            tensor_parallel_mode=tp_mode,
-            reduce_output=False,
-        )
+        # Text-stream QKV (diffusers names). Under qkv_merge, fuse the text
+        # q/k/v into one add_qkv_proj (mirrors FluxJointAttention); the text
+        # stream is force-excluded from quant (kept bf16) in
+        # apply_quant_config_exclude_modules, since the config's exclude-list
+        # names the separate add_q_proj/add_k_proj/add_v_proj.
+        if self._fact_qkv_merge:
+            self.add_qkv_proj = Linear(
+                dim,
+                self.q_dim + 2 * self.kv_dim,
+                bias=True,
+                dtype=dtype,
+                mapping=self.mapping,
+                quant_config=self.quant_config,
+                skip_create_weights_in_init=self.skip_create_weights_in_init,
+                force_dynamic_quantization=self.force_dynamic_quantization,
+                weights_loading_config=WeightsLoadingConfig(
+                    weight_mode=WeightMode.FUSED_QKV_LINEAR
+                ),
+                fused_weight_shard_indices_mapping={
+                    "q": (0, self.local_q_dim),
+                    "k": (self.local_q_dim, self.local_kv_dim),
+                    "v": (self.local_q_dim + self.local_kv_dim, self.local_kv_dim),
+                },
+                tensor_parallel_mode=tp_mode,
+                reduce_output=False,
+            )
+        else:
+            self.add_q_proj = Linear(
+                dim, dim, bias=True, dtype=dtype, mapping=self.mapping,
+                quant_config=self.quant_config,
+                skip_create_weights_in_init=self.skip_create_weights_in_init,
+                force_dynamic_quantization=self.force_dynamic_quantization,
+                tensor_parallel_mode=tp_mode, reduce_output=False,
+            )
+            self.add_k_proj = Linear(
+                dim, dim, bias=True, dtype=dtype, mapping=self.mapping,
+                quant_config=self.quant_config,
+                skip_create_weights_in_init=self.skip_create_weights_in_init,
+                force_dynamic_quantization=self.force_dynamic_quantization,
+                tensor_parallel_mode=tp_mode, reduce_output=False,
+            )
+            self.add_v_proj = Linear(
+                dim, dim, bias=True, dtype=dtype, mapping=self.mapping,
+                quant_config=self.quant_config,
+                skip_create_weights_in_init=self.skip_create_weights_in_init,
+                force_dynamic_quantization=self.force_dynamic_quantization,
+                tensor_parallel_mode=tp_mode, reduce_output=False,
+            )
 
         # QK-norms, applied per-head on the head_dim.
         self.norm_added_q = RMSNorm(
@@ -620,18 +628,10 @@ class QwenJointAttention(Attention):
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._fact_qkv_merge:
-            # Image-only merge: qkv_proj emits the packed image [q|k|v] directly
-            # (no image feature cat). Text stays separate (small); its feature
-            # cat + the [txt|img] sequence cat remain.
+            # Both-stream merge: qkv_proj / add_qkv_proj emit packed [q|k|v]
+            # directly -> no feature cats; only the [txt|img] sequence cat remains.
             img_qkv = self.qkv_proj(hidden_states)
-            txt_qkv = torch.cat(
-                [
-                    self.add_q_proj(encoder_hidden_states),
-                    self.add_k_proj(encoder_hidden_states),
-                    self.add_v_proj(encoder_hidden_states),
-                ],
-                dim=-1,
-            )
+            txt_qkv = self.add_qkv_proj(encoder_hidden_states)
             qkv = torch.cat([txt_qkv, img_qkv], dim=1)
         else:
             img_q, img_k, img_v = self.get_qkv(hidden_states)
@@ -665,10 +665,15 @@ class QwenJointAttention(Attention):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Image QKV (get_qkv returns split q/k/v in both SEPARATE and FUSE modes).
         img_q, img_k, img_v = self.get_qkv(hidden_states)
-        # Text QKV (always separate under image-only merge).
-        txt_q = self.add_q_proj(encoder_hidden_states)
-        txt_k = self.add_k_proj(encoder_hidden_states)
-        txt_v = self.add_v_proj(encoder_hidden_states)
+        # Text QKV.
+        if self._fact_qkv_merge:
+            txt_q, txt_k, txt_v = self.add_qkv_proj(encoder_hidden_states).split(
+                [self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1
+            )
+        else:
+            txt_q = self.add_q_proj(encoder_hidden_states)
+            txt_k = self.add_k_proj(encoder_hidden_states)
+            txt_v = self.add_v_proj(encoder_hidden_states)
 
         # Reshape to (B, S, H, D).
         img_q = img_q.unflatten(-1, (self.local_num_attention_heads, -1))
@@ -1178,6 +1183,13 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         for name, module in self.named_modules():
             if isinstance(module, Linear):
                 is_excluded = quant_config.is_module_excluded_from_quantization(name)
+                # FACT qkv_merge: the fused text add_qkv_proj has a name absent
+                # from the exclude-list (which names add_q_proj/add_k_proj/
+                # add_v_proj). Exclude it iff its separate sources would be
+                # excluded, so the text stream stays bf16 as production intends.
+                if _FACT_QKV_MERGE and not is_excluded and name.endswith(".add_qkv_proj"):
+                    src = name[: -len("add_qkv_proj")] + "add_q_proj"
+                    is_excluded = quant_config.is_module_excluded_from_quantization(src)
                 if is_excluded and getattr(module, "quant_config", None) is not None:
                     module.quant_config = no_quant_config
                     if getattr(module, "_weights_created", False):
@@ -1219,9 +1231,10 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         # checkpoint's separate to_q/to_k/to_v / add_*_proj tensors via params_map.
         params_map = None
         if _FACT_QKV_MERGE:
-            # Image-only merge: only the image stream's to_q/to_k/to_v fuse into
-            # qkv_proj. Text add_*_proj load 1:1 (kept separate for quant).
-            params_map = {"qkv_proj": ["to_q", "to_k", "to_v"]}
+            params_map = {
+                "qkv_proj": ["to_q", "to_k", "to_v"],
+                "add_qkv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
+            }
 
         # Strict model-vs-checkpoint key check (WAN skips this; we keep it for
         # real Qwen weights). Under qkv_merge a fused Linear's own params

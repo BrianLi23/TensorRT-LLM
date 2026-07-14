@@ -364,10 +364,9 @@ def test_qwen_image_transformer_block_parity(transformer_state_dict, transformer
     # Silently ignore missing keys on diffusers side: its Attention has
     # some optional norm/head_dim params we don't need to set.
     our_sd = _remap_checkpoint_keys(block0_sd)
-    # FACT qkv_merge (image-only): the image stream's separate attn.{to_q,to_k,
-    # to_v} tensors concatenate into attn.qkv_proj (dim 0 = [q|k|v]); the text
-    # add_*_proj stay separate. Fuse the image keys so this test loads +
-    # numerically validates the merged forward vs diffusers.
+    # FACT qkv_merge: image attn.{to_q,to_k,to_v} -> attn.qkv_proj and text
+    # attn.add_{q,k,v}_proj -> attn.add_qkv_proj (dim 0 = [q|k|v]). Fuse the keys
+    # so this test loads + numerically validates the merged forward vs diffusers.
     if getattr(our_block.attn, "_fact_qkv_merge", False):
         def _fuse(dst, srcs):
             for p in ("weight", "bias"):
@@ -375,6 +374,7 @@ def test_qwen_image_transformer_block_parity(transformer_state_dict, transformer
                 if all(k in our_sd for k in keys):
                     our_sd[f"attn.{dst}.{p}"] = torch.cat([our_sd.pop(k) for k in keys], dim=0)
         _fuse("qkv_proj", ["to_q", "to_k", "to_v"])
+        _fuse("add_qkv_proj", ["add_q_proj", "add_k_proj", "add_v_proj"])
     _m_our, _u_our = our_block.load_state_dict(our_sd, strict=False)
     assert not _u_our, f"unexpected keys in our block: {_u_our[:3]}"
     # Diffusers' extra (ignored) keys are OK; missing on our side must
