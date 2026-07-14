@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from collections.abc import Callable
 from typing import Any, Dict, Optional, Tuple
 
@@ -26,7 +27,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.linear import (
+    Linear,
+    TensorParallelMode,
+    WeightMode,
+)
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import gelu_tanh, maybe_compile
@@ -41,6 +46,13 @@ from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+# FACT candidate qwen_image_qkv_merge_v1: fuse each stream's separate q/k/v
+# projections into one FUSED_QKV Linear (mirrors FluxJointAttention), removing
+# the two feature-dim cats and merging the image-stream 3 GEMMs -> 1, while
+# keeping the production fused_dit_qk_norm_rope. Read at import (before CUDA-
+# graph capture); production SEPARATE_QKV path is used when unset.
+_FACT_QKV_MERGE = os.environ.get("TRTLLM_ENABLE_FACT_QKV_MERGE", "0") == "1"
 
 _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
@@ -495,11 +507,12 @@ class QwenJointAttention(Attention):
         module_name: Optional[str] = None,
     ):
         config = config or DiffusionModelConfig()
+        self._fact_qkv_merge = _FACT_QKV_MERGE
         super().__init__(
             hidden_size=dim,
             num_attention_heads=num_attention_heads,
             head_dim=attention_head_dim,
-            qkv_mode=QKVMode.SEPARATE_QKV,
+            qkv_mode=QKVMode.FUSE_QKV if self._fact_qkv_merge else QKVMode.SEPARATE_QKV,
             qk_norm=True,
             qk_norm_mode="per_head",
             eps=eps,
@@ -517,7 +530,11 @@ class QwenJointAttention(Attention):
 
         tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
 
-        # Text-stream QKV (diffusers names).
+        # Text-stream QKV (diffusers names). IMAGE-ONLY merge: the image stream
+        # (4096 tokens) fuses q/k/v via the base qkv_proj (qkv_mode above); the
+        # text stream (~51 tokens, negligible perf) stays SEPARATE so the
+        # production quant exclude-list (which names add_q_proj/add_k_proj/
+        # add_v_proj) keeps the text stream in bf16 as the sglang configs intend.
         self.add_q_proj = Linear(
             dim,
             dim,
@@ -602,14 +619,29 @@ class QwenJointAttention(Attention):
         image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        img_q, img_k, img_v = self.get_qkv(hidden_states)
-        txt_q = self.add_q_proj(encoder_hidden_states)
-        txt_k = self.add_k_proj(encoder_hidden_states)
-        txt_v = self.add_v_proj(encoder_hidden_states)
+        if self._fact_qkv_merge:
+            # Image-only merge: qkv_proj emits the packed image [q|k|v] directly
+            # (no image feature cat). Text stays separate (small); its feature
+            # cat + the [txt|img] sequence cat remain.
+            img_qkv = self.qkv_proj(hidden_states)
+            txt_qkv = torch.cat(
+                [
+                    self.add_q_proj(encoder_hidden_states),
+                    self.add_k_proj(encoder_hidden_states),
+                    self.add_v_proj(encoder_hidden_states),
+                ],
+                dim=-1,
+            )
+            qkv = torch.cat([txt_qkv, img_qkv], dim=1)
+        else:
+            img_q, img_k, img_v = self.get_qkv(hidden_states)
+            txt_q = self.add_q_proj(encoder_hidden_states)
+            txt_k = self.add_k_proj(encoder_hidden_states)
+            txt_v = self.add_v_proj(encoder_hidden_states)
 
-        txt_qkv = torch.cat([txt_q, txt_k, txt_v], dim=-1)
-        img_qkv = torch.cat([img_q, img_k, img_v], dim=-1)
-        qkv = torch.cat([txt_qkv, img_qkv], dim=1)
+            txt_qkv = torch.cat([txt_q, txt_k, txt_v], dim=-1)
+            img_qkv = torch.cat([img_q, img_k, img_v], dim=-1)
+            qkv = torch.cat([txt_qkv, img_qkv], dim=1)
 
         if fused_rotary_emb is None:
             fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb, qkv.shape[0])
@@ -631,9 +663,9 @@ class QwenJointAttention(Attention):
         encoder_hidden_states: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Image QKV.
+        # Image QKV (get_qkv returns split q/k/v in both SEPARATE and FUSE modes).
         img_q, img_k, img_v = self.get_qkv(hidden_states)
-        # Text QKV.
+        # Text QKV (always separate under image-only merge).
         txt_q = self.add_q_proj(encoder_hidden_states)
         txt_k = self.add_k_proj(encoder_hidden_states)
         txt_v = self.add_v_proj(encoder_hidden_states)
@@ -1183,11 +1215,39 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 module.create_weights()
                 module.to(device)
 
-        expected = {name for name, _ in self.named_parameters()}
+        # FACT qkv_merge: the fused qkv_proj / add_qkv_proj modules load from the
+        # checkpoint's separate to_q/to_k/to_v / add_*_proj tensors via params_map.
+        params_map = None
+        if _FACT_QKV_MERGE:
+            # Image-only merge: only the image stream's to_q/to_k/to_v fuse into
+            # qkv_proj. Text add_*_proj load 1:1 (kept separate for quant).
+            params_map = {"qkv_proj": ["to_q", "to_k", "to_v"]}
+
+        # Strict model-vs-checkpoint key check (WAN skips this; we keep it for
+        # real Qwen weights). Under qkv_merge a fused Linear's own params
+        # (qkv_proj.*/add_qkv_proj.*) are ABSENT from the checkpoint, which
+        # instead provides the separate sources (to_q/to_k/to_v, add_*_proj);
+        # substitute those into `expected` so mismatch detection still fires.
+        expected: set[str] = set()
+        fused_target_prefixes: list[str] = []
+        if params_map:
+            for name, module in self.named_modules():
+                wc = getattr(module, "weights_loading_config", None)
+                wm = getattr(wc, "weight_mode", None) if wc is not None else None
+                suffix = name.rsplit(".", 1)[-1]
+                if wm == WeightMode.FUSED_QKV_LINEAR and suffix in params_map:
+                    fused_target_prefixes.append(name + ".")
+                    parent = name[: len(name) - len(suffix)]  # keeps trailing "."
+                    has_bias = getattr(module, "bias", None) is not None
+                    for src in params_map[suffix]:
+                        expected.add(f"{parent}{src}.weight")
+                        if has_bias:
+                            expected.add(f"{parent}{src}.bias")
+        for pname, _ in self.named_parameters():
+            if any(pname.startswith(pfx) for pfx in fused_target_prefixes):
+                continue  # fused target param -> represented by its sources above
+            expected.add(pname)
         provided = set(weights)
-        # WAN uses the same shared Linear methods but does not perform this
-        # model-vs-checkpoint key check. Exempt only their known non-serialized
-        # parameters while retaining strict validation for real Qwen weights.
         missing = sorted((expected - provided) - self._non_serialized_quant_parameter_names())
         unexpected = sorted(provided - expected)
         # Dynamic quantization creates scale parameters while loading Linear
@@ -1197,7 +1257,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         if unexpected:
             raise RuntimeError(f"Unexpected keys when loading transformer: {unexpected[:5]}...")
 
-        loader = DynamicLinearWeightLoader(self.model_config)
+        loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
         for name, module in self.named_modules():
             if isinstance(module, Linear):
                 weight_dicts = loader.get_linear_weights(module, name, weights)
