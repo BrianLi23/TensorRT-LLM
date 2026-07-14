@@ -55,6 +55,16 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 # graph capture); production SEPARATE_QKV path is used when unset.
 _FACT_QKV_MERGE = os.environ.get("TRTLLM_ENABLE_FACT_QKV_MERGE", "0") == "1"
 
+# FACT candidate qwen_image_cute_qkv_norm_rope_pack_v1: a CuteDSL superset that
+# fuses the (post-qkv_merge) sequence-cat + QK-norm + RoPE into one kernel,
+# eliminating the packed-buffer round-trip. Requires qkv_merge (needs the two
+# packed txt/img qkv). Import (which pulls in CuteDSL) only when enabled.
+_FACT_CUTE_QKV_NORM_ROPE = (
+    _FACT_QKV_MERGE and os.environ.get("TRTLLM_ENABLE_FACT_CUTE_QKV_NORM_ROPE", "0") == "1"
+)
+if _FACT_CUTE_QKV_NORM_ROPE:
+    from tensorrt_llm._torch.visual_gen import fact_kernels  # noqa: F401
+
 _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
     (".net.2.", ".down_proj."),
@@ -524,6 +534,15 @@ class QwenJointAttention(Attention):
             module_name=module_name,
         )
         self.head_dim = attention_head_dim
+        # CuteDSL superset: valid on the merged packed path + head_dim 128.
+        # Measured to help bf16 (-2.3%) and nvfp4 (-4.3%) but REGRESS fp8 (+1.3%)
+        # vs the qkv_merge base, so it is disabled for FP8 (per the same-quant
+        # gate). fp8 keeps the production cat + fused_dit_qk_norm_rope.
+        _qa = getattr(self.quant_config, "quant_algo", None) if self.quant_config else None
+        _is_fp8 = _qa is not None and "FP8" in str(_qa)
+        self._use_fact_cute_superset = (
+            _FACT_CUTE_QKV_NORM_ROPE and attention_head_dim == 128 and not _is_fp8
+        )
         self._supports_key_padding_mask = _supports_qwen_key_padding_mask(
             self.attn_backend, self.attn
         )
@@ -632,16 +651,40 @@ class QwenJointAttention(Attention):
             # directly -> no feature cats; only the [txt|img] sequence cat remains.
             img_qkv = self.qkv_proj(hidden_states)
             txt_qkv = self.add_qkv_proj(encoder_hidden_states)
+            if fused_rotary_emb is None:
+                fused_rotary_emb = qwen_joint_freqs_to_cos_sin(
+                    image_rotary_emb, hidden_states.shape[0]
+                )
+            freqs_cos, freqs_sin = fused_rotary_emb
+            if self._use_fact_cute_superset:
+                # FACT CuteDSL superset: fuse the sequence-cat + QK-norm + RoPE
+                # into one kernel (eliminates the packed-buffer round-trip).
+                qkv = torch.ops.trtllm.fact_cute_qkv_norm_rope_pack(
+                    txt_qkv, img_qkv, freqs_cos, freqs_sin,
+                    self.norm_q.weight, self.norm_k.weight,
+                    self.norm_added_q.weight, self.norm_added_k.weight,
+                    self.head_dim, self.eps,
+                )
+                return qkv.split(
+                    [self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1
+                )
             qkv = torch.cat([txt_qkv, img_qkv], dim=1)
-        else:
-            img_q, img_k, img_v = self.get_qkv(hidden_states)
-            txt_q = self.add_q_proj(encoder_hidden_states)
-            txt_k = self.add_k_proj(encoder_hidden_states)
-            txt_v = self.add_v_proj(encoder_hidden_states)
+            self.apply_packed_qk_norm_rope(
+                qkv, freqs_cos, freqs_sin,
+                num_txt_tokens=encoder_hidden_states.shape[1],
+                q_add_weight=self.norm_added_q.weight,
+                k_add_weight=self.norm_added_k.weight,
+            )
+            return qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
 
-            txt_qkv = torch.cat([txt_q, txt_k, txt_v], dim=-1)
-            img_qkv = torch.cat([img_q, img_k, img_v], dim=-1)
-            qkv = torch.cat([txt_qkv, img_qkv], dim=1)
+        img_q, img_k, img_v = self.get_qkv(hidden_states)
+        txt_q = self.add_q_proj(encoder_hidden_states)
+        txt_k = self.add_k_proj(encoder_hidden_states)
+        txt_v = self.add_v_proj(encoder_hidden_states)
+
+        txt_qkv = torch.cat([txt_q, txt_k, txt_v], dim=-1)
+        img_qkv = torch.cat([img_q, img_k, img_v], dim=-1)
+        qkv = torch.cat([txt_qkv, img_qkv], dim=1)
 
         if fused_rotary_emb is None:
             fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb, qkv.shape[0])
