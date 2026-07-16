@@ -93,11 +93,19 @@ done
 
 # _torch: keep the wheel's copy as the base (its custom_ops must match the
 # wheel's compiled torch-op registrations) and symlink only these subtrees:
-for sub in visual_gen models modules attention_backend speculative configs pyexecutor; do
+for sub in visual_gen models modules attention_backend speculative configs \
+           pyexecutor peft shared_tensor; do
     if [ -e "$SITE/_torch/$sub" ] && [ ! -L "$SITE/_torch/$sub" ]; then
         mv "$SITE/_torch/$sub" "$SITE/_torch/$sub.wheel_orig"
     fi
     ln -sfn "$FORK/_torch/$sub" "$SITE/_torch/$sub"
+done
+
+# _torch: also link any module that exists ONLY in the repo (new files the
+# wheel predates, e.g. alltoall_watchdog.py, mmap_utils.py):
+for p in "$FORK"/_torch/*; do
+    name=$(basename "$p")
+    [ -e "$SITE/_torch/$name" ] || ln -s "$p" "$SITE/_torch/$name"
 done
 
 # runtime/ contains one compiled extension in the wheel that the source tree
@@ -168,3 +176,6 @@ From here: edit the repo, run with `.venv-rc20/bin/python`, changes are live.
 | "No module named 'kv_cache_manager_v2.rawref._rawref'" | symlinked runtime/ lost the wheel's compiled extension | the `cp -n ... _rawref*.so` line in step 3 |
 | "operator trtllm::<op> does not exist" at import | fork's `_torch/custom_ops` newer than wheel bindings | don't symlink `_torch` whole; use the per-subtree overlay in step 3 |
 | "Error 101: invalid device ordinal" from cuInit everywhere | a GPU fell off the bus (here: PCI 0000:03:00.0, `/dev/nvidia1` → ENODEV) | node-level driver reload/reboot by infra; no in-pod workaround |
+| venv python: "No such file or directory" after pod restart | `/root/.local/share/uv/python` is ephemeral; venv symlinks dangle | `uv python install 3.12.12` (site-packages on /workspace survives) |
+| libmpi errors return after pod restart | apt packages are ephemeral too | `apt-get install -y openmpi-bin libopenmpi-dev` |
+| "unexpected keyword argument" / "cannot import name" on a tensorrt_llm symbol | repo module (symlinked) calls a newer API in a wheel-copy module | overlay that module too (add to the step-3 subtree list) |
